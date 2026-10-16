@@ -1,0 +1,350 @@
+#!/usr/bin/env python3
+"""
+ou-log-read-tool - defensive web access-log analyzer (Apache / Nginx).
+
+Detects common attack indicators (SQLi, XSS, path traversal, command injection,
+sensitive-file discovery, scanner tools) in access logs.
+Findings are heuristic indicators, not proof that an attack succeeded.
+"""
+import argparse
+import glob
+import gzip
+import os
+import re
+import sys
+from collections import Counter
+from urllib.parse import unquote
+
+TOOL_NAME = "ou-log-read-tool"
+VERSION = "1.0"
+
+BANNER = r"""
+░█████╗░██╗░░░██╗░░░░░░██╗░░░░░░█████╗░░██████╗░░░░░░░██████╗░███████╗░█████╗░██████╗░░░░░░░████████╗░█████╗░░█████╗░██╗░░░░░
+██╔══██╗██║░░░██║░░░░░░██║░░░░░██╔══██╗██╔════╝░░░░░░░██╔══██╗██╔════╝██╔══██╗██╔══██╗░░░░░░╚══██╔══╝██╔══██╗██╔══██╗██║░░░░░
+██║░░██║██║░░░██║█████╗██║░░░░░██║░░██║██║░░██╗░█████╗██████╔╝█████╗░░███████║██║░░██║█████╗░░░██║░░░██║░░██║██║░░██║██║░░░░░
+██║░░██║██║░░░██║╚════╝██║░░░░░██║░░██║██║░░╚██╗╚════╝██╔══██╗██╔══╝░░██╔══██║██║░░██║╚════╝░░░██║░░░██║░░██║██║░░██║██║░░░░░
+╚█████╔╝╚██████╔╝░░░░░░███████╗╚█████╔╝╚██████╔╝░░░░░░██║░░██║███████╗██║░░██║██████╔╝░░░░░░░░░██║░░░╚█████╔╝╚█████╔╝███████╗
+░╚════╝░░╚═════╝░░░░░░░╚══════╝░╚════╝░░╚═════╝░░░░░░░╚═╝░░╚═╝╚══════╝╚═╝░░╚═╝╚═════╝░░░░░░░░░░╚═╝░░░░╚════╝░░╚════╝░╚══════╝
+"""
+
+# Known access-log locations per web server (Kali / Debian / Ubuntu / RHEL)
+SERVER_LOGS = {
+    "apache": [
+        "/var/log/apache2/access.log",
+        "/var/log/apache2/other_vhosts_access.log",
+        "/var/log/httpd/access_log",
+    ],
+    "nginx": [
+        "/var/log/nginx/access.log",
+    ],
+}
+
+PATTERNS = [
+    ("SQL Injection", re.compile(
+        r"(?:union\s+select|select\s+.+\s+from|or\s+['\"]?\d+['\"]?\s*=\s*['\"]?\d+|sleep\s*\(|benchmark\s*\()", re.I
+    ), "High"),
+    ("Cross-Site Scripting (XSS)", re.compile(
+        r"<\s*script\b|javascript\s*:|onerror\s*=|onload\s*=", re.I
+    ), "High"),
+    ("Path Traversal", re.compile(
+        r"(?:\.\./|\.\.\\|/etc/passwd|/proc/self/environ|boot\.ini)", re.I
+    ), "High"),
+    ("Command Injection", re.compile(
+        r"(?:;\s*(?:cat|id|whoami|uname|wget|curl|nc)\b|\|\s*(?:cat|id|whoami|sh|bash)\b|`[^`]+`|\$\([^)]*\))", re.I
+    ), "High"),
+    ("Sensitive File / Admin Discovery", re.compile(
+        r"/(?:\.env|\.git/config|wp-config\.php|phpmyadmin|admin(?:[/?\s]|$))", re.I
+    ), "Medium"),
+    ("Suspicious Scanner / Tool", re.compile(
+        r"\b(?:sqlmap|nikto|nmap|masscan|gobuster|dirbuster|wpscan|hydra)\b", re.I
+    ), "Medium"),
+]
+
+# Combined log format: ip - - [time] "request" status size "referer" "user-agent"
+LOG_RE = re.compile(
+    r'^(?P<ip>\S+)\s+\S+\s+\S+\s+\[[^\]]+\]\s+"(?P<request>[^"]*)"'
+    r'\s+(?P<status>\d{3}|-)\s+(?P<size>\S+)'
+    r'(?:\s+"(?P<referer>[^"]*)"\s+"(?P<agent>[^"]*)")?'
+)
+
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+class Colors:
+    def __init__(self, enabled):
+        e = enabled
+        self.red = "\033[91m" if e else ""
+        self.yellow = "\033[93m" if e else ""
+        self.green = "\033[92m" if e else ""
+        self.cyan = "\033[96m" if e else ""
+        self.bold = "\033[1m" if e else ""
+        self.reset = "\033[0m" if e else ""
+
+    def severity(self, level):
+        return self.red if level == "High" else self.yellow
+
+
+class Tee:
+    """Write to the terminal and, optionally, to a report file (without colors)."""
+
+    def __init__(self, stream, report):
+        self.stream = stream
+        self.report = report
+
+    def write(self, text):
+        self.stream.write(text)
+        if self.report:
+            self.report.write(ANSI_RE.sub("", text))
+
+    def flush(self):
+        self.stream.flush()
+        if self.report:
+            self.report.flush()
+
+
+def decode_repeated(value, rounds=3):
+    """Decode URL encoding repeatedly, stopping when unchanged."""
+    current = value
+    for _ in range(rounds):
+        decoded = unquote(current)
+        if decoded == current:
+            break
+        current = decoded
+    return current
+
+
+def is_log_name(name):
+    """Heuristic for files inside a directory given with -d."""
+    lower = name.lower()
+    if "error" in lower:
+        return False
+    return "access" in lower or ".log" in lower or lower.endswith(".gz")
+
+
+def files_from_dir(directory):
+    found = []
+    for name in sorted(os.listdir(directory)):
+        path = os.path.join(directory, name)
+        if os.path.isfile(path) and is_log_name(name):
+            found.append(path)
+    return found
+
+
+def auto_detect(server, include_rotated):
+    servers = SERVER_LOGS.keys() if server == "all" else [server]
+    found = []
+    for srv in servers:
+        for base in SERVER_LOGS[srv]:
+            candidates = [base]
+            if include_rotated:
+                candidates += sorted(glob.glob(base + ".*"))
+            for path in candidates:
+                if os.path.isfile(path) and path not in found:
+                    found.append(path)
+    return found
+
+
+def open_log(path):
+    if path.endswith(".gz"):
+        return gzip.open(path, "rt", encoding="utf-8", errors="replace")
+    return open(path, "r", encoding="utf-8", errors="replace")
+
+
+def analyze_line(line):
+    match = LOG_RE.search(line)
+    if not match:
+        return None
+
+    request = match.group("request")
+    agent = match.group("agent") or ""
+    decoded = decode_repeated(request)
+    haystacks = (request, decoded, agent)  # scanners often reveal themselves in the UA
+
+    findings = []
+    for name, pattern, severity in PATTERNS:
+        if any(pattern.search(h) for h in haystacks):
+            findings.append((name, severity))
+
+    return {
+        "ip": match.group("ip"),
+        "request": request,
+        "decoded": decoded,
+        "agent": agent,
+        "status": match.group("status"),
+        "findings": findings,
+    }
+
+
+def analyze_file(path, show_clean, counts, suspicious_ips, c):
+    """Analyze one file. Returns (lines_read, alerts, ok)."""
+    lines_read = 0
+    alerts = 0
+    print(f"{c.cyan}[*] Analyzing {path}{c.reset}\n")
+
+    try:
+        handle = open_log(path)
+        with handle:
+            for line_number, line in enumerate(handle, start=1):
+                lines_read += 1
+                result = analyze_line(line.rstrip("\n"))
+                if result is None:
+                    if show_clean:
+                        print(f"[INFO] Line {line_number}: unsupported log format")
+                    continue
+
+                if result["findings"]:
+                    alerts += 1
+                    suspicious_ips[result["ip"]] += 1
+                    print(f"{c.bold}[ALERT]{c.reset} {os.path.basename(path)} | Line: {line_number}")
+                    print(f"  IP:      {result['ip']}")
+                    print(f"  Status:  {result['status']}")
+                    print(f"  Request: {result['request']}")
+                    if result["decoded"] != result["request"]:
+                        print(f"  Decoded: {result['decoded']}")
+                    if result["agent"]:
+                        print(f"  Agent:   {result['agent']}")
+                    for name, severity in result["findings"]:
+                        counts[name] += 1
+                        print(f"  Attack indicator: {name} | Severity: "
+                              f"{c.severity(severity)}{severity}{c.reset}")
+                    print()
+                elif show_clean:
+                    print(f"{c.green}[OK]{c.reset} Line {line_number}: no known indicator detected")
+    except PermissionError:
+        print(f"{c.red}[ERROR] Permission denied: {path}{c.reset}")
+        print(f"        Run with sudo:  sudo {TOOL_NAME} ...\n")
+        return 0, 0, False
+    except OSError as exc:
+        print(f"{c.red}[ERROR] Cannot read {path}: {exc}{c.reset}\n")
+        return 0, 0, False
+
+    return lines_read, alerts, True
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog=TOOL_NAME,
+        description="Analyze Apache/Nginx access logs for common attack indicators.",
+        epilog=(
+            "examples:\n"
+            f"  sudo {TOOL_NAME}                          auto-detect Apache/Nginx logs\n"
+            f"  sudo {TOOL_NAME} -s nginx -a              Nginx only, incl. rotated/.gz logs\n"
+            f"  sudo {TOOL_NAME} -f /var/log/apache2/access.log\n"
+            f"  sudo {TOOL_NAME} -d /var/log/apache2/     every log inside a folder\n"
+            f"  sudo {TOOL_NAME} -f a.log -f b.log -o report.txt\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("-f", "--file", action="append", default=[], metavar="FILE",
+                        help="log file to analyze (can be used several times)")
+    parser.add_argument("-d", "--dir", action="append", default=[], metavar="DIR",
+                        help="analyze all log files inside this directory (can be repeated)")
+    parser.add_argument("-s", "--server", choices=["apache", "nginx", "all"], default="all",
+                        help="which web server's default logs to read (default: all)")
+    parser.add_argument("-a", "--all", action="store_true",
+                        help="with auto-detect: also read rotated (.1) and compressed (.gz) logs")
+    parser.add_argument("-o", "--output", metavar="FILE",
+                        help="save the report to FILE (as well as printing it)")
+    parser.add_argument("--show-clean", action="store_true",
+                        help="also print lines with no detected indicators")
+    parser.add_argument("--no-color", action="store_true", help="disable colored output")
+    parser.add_argument("-q", "--quiet", action="store_true", help="do not print the banner")
+    parser.add_argument("-v", "--version", action="version", version=f"{TOOL_NAME} {VERSION}")
+    return parser
+
+
+def main():
+    args = build_parser().parse_args()
+
+    report = None
+    if args.output:
+        try:
+            report = open(args.output, "w", encoding="utf-8")
+        except OSError as exc:
+            print(f"[ERROR] Cannot write report file: {exc}")
+            return 1
+        sys.stdout = Tee(sys.stdout, report)
+
+    use_color = sys.__stdout__.isatty() and not args.no_color and "NO_COLOR" not in os.environ
+    c = Colors(use_color)
+
+    if not args.quiet:
+        print(f"{c.cyan}{BANNER}{c.reset}")
+        print(f"  {TOOL_NAME} v{VERSION} - Apache/Nginx access log analyzer\n")
+
+    # Decide what to read: explicit files/dirs win; otherwise auto-detect.
+    files = []
+    for directory in args.dir:
+        if not os.path.isdir(directory):
+            print(f"{c.red}[ERROR] Not a directory: {directory}{c.reset}")
+            return 1
+        files += files_from_dir(directory)
+    files += args.file
+
+    if args.file or args.dir:
+        files = list(dict.fromkeys(files))  # unique, keep order
+        if not files:
+            print(f"{c.red}[ERROR] No log files found in the given path(s).{c.reset}")
+            return 1
+    else:
+        files = auto_detect(args.server, args.all)
+        if not files:
+            print(f"{c.red}[ERROR] No log files found in default locations:{c.reset}")
+            servers = SERVER_LOGS.keys() if args.server == "all" else [args.server]
+            for srv in servers:
+                for p in SERVER_LOGS[srv]:
+                    print(f"        {p}")
+            print("        Start the web server (e.g. sudo systemctl start apache2),")
+            print(f"        or pass a path with -f / -d.  See: {TOOL_NAME} -h")
+            return 1
+        print("[*] Auto-detected log files:")
+        for p in files:
+            print(f"    {p}")
+        print()
+
+    counts = Counter()
+    suspicious_ips = Counter()
+    total_lines = total_alerts = analyzed = 0
+
+    for path in files:
+        lines_read, alerts, ok = analyze_file(path, args.show_clean, counts, suspicious_ips, c)
+        total_lines += lines_read
+        total_alerts += alerts
+        analyzed += 1 if ok else 0
+
+    print(f"{c.bold}========== SUMMARY =========={c.reset}")
+    print(f"Files analyzed: {analyzed}/{len(files)}")
+    print(f"Lines read: {total_lines}")
+    print(f"Lines with alerts: {total_alerts}")
+    print("Indicators by type:")
+    if counts:
+        for name, count in counts.most_common():
+            print(f"  {name}: {count}")
+    else:
+        print("  No known indicators detected.")
+    print("IPs with most alerts:")
+    if suspicious_ips:
+        for ip, count in suspicious_ips.most_common(10):
+            print(f"  {ip}: {count}")
+    else:
+        print("  None")
+    print("\nNote: findings are heuristic indicators, not proof that an attack succeeded.")
+
+    if report:
+        sys.stdout = sys.__stdout__
+        report.close()
+        print(f"[*] Report saved to {args.output}")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        import signal
+        signal.signal(signal.SIGPIPE, signal.SIG_DFL)  # quiet exit when piped into head/less
+    except (ImportError, AttributeError, ValueError):
+        pass
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        print("\n[!] Interrupted.")
+        sys.exit(130)
